@@ -11,13 +11,16 @@
 //     （fit_quad=0 时 2 点直线），样本对先过方向相容预检、解出模型
 //     后 3 样本自一致才全表计数；内点判定为双约束（横向残差
 //     <= x_tol 且节点方向与模型切向夹角达标），按加权 MSAC 分数
-//     Σ w·(τ²−r²) 择优；内点加权最小二乘精修后全表重收内点，再按
-//     miss_max×窗口高 断线切分取最长连续子段（再精修），内点硬删除
+//     Σ w·(τ²−r²) 择优；内点每窗口仅保留横向残差最近的一个节点
+//     （收集端"一窗一点"，防双缘混编，落选者回池可归他线）后经加权
+//     最小二乘精修，全表重收内点并再去重，再按 miss_max×窗口高 断线
+//     切分取最长连续子段（再精修），内点硬删除
 //     （一节点只归一线）后提取下一条直至不足
 //   输出：内点节点序列（按 y 降序）即车道线中心点链 centers；评分
 //     = 0.28·链长 + 0.22·端到端延展 + 0.50·log10(1+平均置信度)；未达
-//     min_length、居顶部噪声带（top_noise）或链呈锯齿形态（双缘混线，
-//     连续折返 ≥3）的链 valid=false 且得分打折；线底端播种在顶部
+//     min_length、居顶部噪声带（top_noise）或链呈锯齿形态（节点摆动
+//     致连续折返 ≥3；同窗双缘根源已由每窗去重消除）的链 valid=false
+//     且得分打折；线底端播种在顶部
 //     top_noise_ratio 噪声带内 → top_noise
 //
 // 链拟合（描述性，fit_quad 开关）：MSAC 3 点（抛物线）/2 点（直线）
@@ -754,7 +757,8 @@ void buildClu(FmlSegCluster &c, const CandLine &cl,
     }
     dedupIndices(c.indices, idsBuf.data(), (int)idsBuf.size(), st, nSeg);
     // centers：内点节点按 y 降序（自底向上，与链渲染/延展语义一致；
-    // 同 y 并列按 x 升序，保证确定性输出）
+    // 提取层保证每线每窗单节点，同 y 并列理论上不再出现，x 升序规则
+    // 仅留作确定性防御）
     orderBuf.assign(inl, inl + cl.cnt);
     std::sort(orderBuf.begin(), orderBuf.end(),
               [&](int a, int b)
@@ -766,13 +770,15 @@ void buildClu(FmlSegCluster &c, const CandLine &cl,
     c.centers.clear();
     for (int q : orderBuf)
         c.centers.push_back({nodes[q].x, nodes[q].y});
-    // 链锯齿形态门限（拒绝双缘混线）：真实车道线 x(y) 平滑，个别窗口
-    // 因干扰出现孤立折返可容忍；两条近平行边被同一模型收编时，链在
-    // 左右两簇间持续交替——"相邻差分反号且双侧幅值超阈"的折返连续
-    // 出现。连续折返 ≥3（4 个相邻差分左右交替）判为锯齿链，
-    // valid=false（灰显 + 打分打折，与 top_noise 同处理；不删除，
-    // 保持其余簇排名稳定）。阈值不入参数面：4px 幅阈高于节点抖动
-    // （≤2px）；正常干扰线最长连续折返 ≤2，双缘混线 ≥3
+    // 链锯齿形态门限（长期保留的框架层兜底）：同窗重复收编已由提取层
+    // "每窗最近去重"从根源消除，正常输出不再产生同 y 水平跳变的锯齿
+    // 链；本判据现兜的是节点测量本身左右摆动的残留案例（窗口分组质量
+    // 等框架层问题）——每链一遍 O(n) 扫描，成本可忽略，不设删除计划。
+    // 真实车道线 x(y) 平滑，个别窗口因干扰出现孤立折返可容忍；"相邻
+    // 差分反号且双侧幅值超阈"的折返连续出现即判锯齿。连续折返 ≥3
+    //（4 个相邻差分左右交替）判为锯齿链，valid=false（灰显 + 打分打折，
+    // 与 top_noise 同处理；不删除，保持其余簇排名稳定）。阈值不入参数
+    // 面：4px 幅阈高于节点抖动（≤2px）；正常干扰线最长连续折返 ≤2
     bool zigzag = false;
     {
         const int nC = (int)c.centers.size();
@@ -1567,8 +1573,13 @@ int fml_cluster_lines(const std::vector<cv::Vec4f> &lines,
     // ---- 全局方向加权 MSAC：逐线提取候选 ----
     // 每轮在全部剩余节点上拟合一条最优线（内点判定 = 横向残差
     // <= x_tol 且方向与模型切向夹角达标的硬双约束；择优用加权
-    // MSAC 分数 Σ w·(τ²−r²)，同内点数下残差小者胜），加权最小二乘
-    // 精修后硬删除其内点，再在剩余节点上提取下一条。交叉线的节点
+    // MSAC 分数 Σ w·(τ²−r²)，同内点数下残差小者胜），内点集每窗口
+    // 仅保留残差最近的一个节点（收集端"一窗一点"：采样端同窗双点
+    // 本已被范德蒙 det 退化防护天然拒绝，此处把同一原则补齐到全表
+    // 收集，双缘不再被同一模型收编拉出水平跳变锯齿；落选节点未登记
+    // 未删，自然回池可归他线），加权最小二乘
+    // 精修后全表重收内点再经同样的每窗去重，然后断线切分取最长连续
+    // 子段、硬删除其内点，再在剩余节点上提取下一条。交叉线的节点
     // 对在方向预检/内点判据处即被拒绝，不以位置相近混入同线；断线
     // 跨度由 miss_max 切分约束
     //
@@ -1699,6 +1710,113 @@ int fml_cluster_lines(const std::vector<cv::Vec4f> &lines,
         for (; i < nRem; ++i)
             if (sInl(i, a2, a1, a0))
                 dst.push_back(i);
+    };
+
+    // ---- 内点表按窗口（y 桶）排序 + 每窗最近去重（收集端"一窗一点"）----
+    // 与采样端"一窗一点"的对称件：采样期同窗双点由 det 退化防护天然
+    // 拒绝（范德蒙行列式含 y 差因子），但模型定下后的全表内点收集不
+    // 看窗口——同窗双缘/近旁节点会被同一模型同时收编，链上即同 y 水平
+    // 跳变（锯齿根源，旧贪心生长版本有"一窗一匹配"语义）。此处补齐：
+    // 一条线每窗口至多一个内点节点，取横向残差最近者。
+    const float invK = 1.f / (float)k; // 桶键换算（窗高 k，确定性）
+    // y 桶计数排序（O(nInl+nBin)，同桶保持原序=槽位/x 升序，确定性）；
+    // 去重与 4.5 断线切分共用同一份有序结果（原 4.5 段排序提取而来）
+    auto sortInlByBand = [&](std::vector<int> &lst)
+    {
+        const int nL = (int)lst.size();
+        int binCnt[48] = {0};
+        const int nBin = nBands + 1 < 48 ? nBands + 1 : 47;
+        for (int q = 0; q < nL; ++q)
+        {
+            int b = (int)(eY[lst[q]] * invK);
+            b = b < 0 ? 0 : (b >= nBin ? nBin - 1 : b);
+            ++binCnt[b];
+        }
+        int acc = 0;
+        for (int b = 0; b < nBin; ++b)
+        {
+            const int c = binCnt[b];
+            binCnt[b] = acc;
+            acc += c;
+        }
+        inlTmp.assign(lst.begin(), lst.end());
+        for (int q = 0; q < nL; ++q)
+        {
+            int b = (int)(eY[inlTmp[q]] * invK);
+            b = b < 0 ? 0 : (b >= nBin ? nBin - 1 : b);
+            lst[binCnt[b]++] = inlTmp[q];
+        }
+    };
+    // 桶序表上原地收拢：同桶（同窗）仅保留 |eX−pred| 最小者，平局取
+    // 权重大、再取槽位小（桶内原升序，严格优才换即首个胜）。落选节点
+    // 不进登记集 → 不被硬删除，自然留池参与后续提线（真平行双车道各
+    // 归各线；宽标线假边线若撑不起门限由既有关口消化）。写指针 j 恒不
+    // 超过未读区起点，原地安全
+    auto dedupPerBand = [&](std::vector<int> &lst,
+                            float a2, float a1, float a0)
+    {
+        const int nL = (int)lst.size();
+        int j = 0;
+        for (int i = 0; i < nL;)
+        {
+            const int b = (int)(eY[lst[i]] * invK);
+            float rBest =
+                std::fabs(eX[lst[i]] - ((a2 * eY[lst[i]] + a1) * eY[lst[i]] + a0));
+            int best = i;
+            ++i;
+            for (; i < nL && (int)(eY[lst[i]] * invK) == b; ++i)
+            {
+                const float r = std::fabs(
+                    eX[lst[i]] - ((a2 * eY[lst[i]] + a1) * eY[lst[i]] + a0));
+                if (r < rBest || (r == rBest && eW[lst[i]] > eW[lst[best]]))
+                {
+                    rBest = r;
+                    best = i;
+                }
+            }
+            lst[j++] = lst[best];
+        }
+        lst.resize(j);
+    };
+    // 去重退化回退用：精修前原始内点集副本（含同窗重复；每线至多两次
+    // 向量拷贝，容量跨帧复用）
+    static thread_local std::vector<int> rawBuf;
+    // y 升序内点表上断线切分：相邻纵向间隙 > miss_max×窗高 处切断，
+    // 节点数最多的连续子段（平局比权重和）原地收拢为 lst 前缀并重新
+    // 加权精修系数；最大子段仍不足 kMinNodeInl 返回 false（lst 不收拢）
+    auto pickBestRun = [&](std::vector<int> &lst, float &a2, float &a1,
+                           float &a0) -> bool
+    {
+        const int nL = (int)lst.size();
+        const float maxGap = (float)p.miss_max * (float)k;
+        int segStart = 0, bStart = 0, bCnt = 0;
+        float bW = -1.f;
+        for (int i = 1; i <= nL; ++i)
+        {
+            if (i < nL && eY[lst[i]] - eY[lst[i - 1]] <= maxGap)
+                continue;
+            const int cnt = i - segStart;
+            float sw = 0.f;
+            for (int q = segStart; q < i; ++q)
+                sw += eW[lst[q]];
+            if (cnt > bCnt || (cnt == bCnt && sw > bW))
+            {
+                bCnt = cnt;
+                bStart = segStart;
+                bW = sw;
+            }
+            segStart = i;
+        }
+        if (bCnt < kMinNodeInl)
+            return false;
+        for (int q = 0; q < bCnt; ++q) // 原地收拢为选中子段
+            lst[q] = lst[bStart + q];
+        lst.resize(bCnt);
+        // 子段重新加权精修（内点集即子段本身，不再重收——子段内纵向
+        // 无大间隙，LSQ 后残差只会更小）
+        wlsFit(eX.data(), eY.data(), eW.data(), lst.data(), bCnt,
+               p.fit_quad, a2, a1, a0);
+        return true;
     };
 
     while (nRem >= kMinNodeInl)
@@ -1928,78 +2046,60 @@ int fml_cluster_lines(const std::vector<cv::Vec4f> &lines,
         // 3. MSAC 最优模型的内点集 → 加权最小二乘精修（解奇异则
         //    保持 MSAC 模型）。inlBuf 存 SoA 槽位（与热数组同域）
         collectInl(bestA2, bestA1, bestA0, inlBuf);
+        // 3.5 每窗最近去重（收集端"一窗一点"）：精修模型只由各窗口
+        //     被选中的单缘点集构建，不被双缘内点拉向两缘中间。去重
+        //     后不足 kMinNodeInl 异窗内点则本线回退旧流程（原始集
+        //     登记，锯齿判据兜底）：双缘假簇仍像旧版那样被"无效短链"
+        //     消耗掉，不改变提取的终止/删点动力学，避免提前 break
+        //     连坐同帧后续真线（实测无回退时 160 类图 7 簇塌 4 簇）
+        rawBuf = inlBuf; // 原始内点集留底（供 4.5 回退）
+        sortInlByBand(inlBuf);
+        dedupPerBand(inlBuf, bestA2, bestA1, bestA0);
+        bool bandDedup = (int)inlBuf.size() >= kMinNodeInl;
         float mA2 = bestA2, mA1 = bestA1, mA0 = bestA0;
-        wlsFit(eX.data(), eY.data(), eW.data(), inlBuf.data(),
-               (int)inlBuf.size(), p.fit_quad, mA2, mA1, mA0);
+        if (bandDedup)
+            wlsFit(eX.data(), eY.data(), eW.data(), inlBuf.data(),
+                   (int)inlBuf.size(), p.fit_quad, mA2, mA1, mA0);
+        else
+            wlsFit(eX.data(), eY.data(), eW.data(), rawBuf.data(),
+                   (int)rawBuf.size(), p.fit_quad, mA2, mA1, mA0);
         // 4. 精修模型全表重收内点（模型更准，允许集合较 MSAC 轮
         //    扩张；单轮精修不迭代——下游链拟合还有最小二乘）
         collectInl(mA2, mA1, mA0, inlBuf);
+        rawBuf = inlBuf; // 重收后的原始集留底
+        if (bandDedup)
+        {
+            // 4.2 再去重：扩张重收可能带回同窗重复；每窗唯一是集合
+            //     属性，此后不再有引入途径
+            sortInlByBand(inlBuf);
+            dedupPerBand(inlBuf, mA2, mA1, mA0);
+            if ((int)inlBuf.size() < kMinNodeInl)
+                bandDedup = false; // 扩张集去重后崩到门下：整线回退
+        }
         // 4.5 最大容许断线距离：内点按 y 升序扫描相邻纵向间隙，超
         //     过 miss_max×窗口高 处切断；仅节点数最多的连续子段作为
         //     本线输出（子段重新加权精修后登记），其余子段节点放回
         //     剩余池参与后续迭代——足够长则独立成线，太短因不足最小
         //     内点门限自然丢弃。防止把跨大间隙（长虚线空档/遮挡）的
         //     虚假长链拟合为一条曲线。复用 miss_max 参数，无新增参
-        //     数面；切分为每线一次小数组排序+线性扫描，性能可忽略
+        //     数面。去重集上最大子段不足门限时不终止帧提取，而是回
+        //     退原始集（含同窗重复）按旧流程切分登记——回退线交给锯
+        //     齿判据处置，旧版在该情形本就是"登记无效链并删点续提"
         {
-            // y 桶计数排序：桶宽 = 窗口高 k（同桶内间隙必然 ≤ k，不
-            // 会切断，桶内无需排序）——替代比较排序，O(nInl + 桶数)
-            const int nInl = (int)inlBuf.size();
-            const float invK = 1.f / (float)k;
-            int binCnt[48] = {0};
-            const int nBin = nBands + 1 < 48 ? nBands + 1 : 47;
-            for (int q = 0; q < nInl; ++q)
+            bool reg = false;
+            if (bandDedup)
             {
-                int b = (int)(eY[inlBuf[q]] * invK);
-                b = b < 0 ? 0 : (b >= nBin ? nBin - 1 : b);
-                ++binCnt[b];
+                // 表已由 4.2 按 y 桶升序（去重与切分共用同一排序）
+                reg = pickBestRun(inlBuf, mA2, mA1, mA0);
             }
-            int acc = 0;
-            for (int b = 0; b < nBin; ++b)
+            if (!reg)
             {
-                const int c = binCnt[b];
-                binCnt[b] = acc;
-                acc += c;
+                inlBuf = rawBuf;
+                sortInlByBand(inlBuf);
+                if (!pickBestRun(inlBuf, mA2, mA1, mA0))
+                    break; // 原始集也撑不起：剩余内点为零散垃圾聚簇，
+                           // 整线作废并终止提取（旧版同款处置）
             }
-            inlTmp.assign(inlBuf.begin(), inlBuf.end());
-            for (int q = 0; q < nInl; ++q)
-            {
-                int b = (int)(eY[inlTmp[q]] * invK);
-                b = b < 0 ? 0 : (b >= nBin ? nBin - 1 : b);
-                inlBuf[binCnt[b]++] = inlTmp[q];
-            }
-            const float maxGap = (float)p.miss_max * (float)k;
-            int segStart = 0, bestStart = 0, bestCnt = 0;
-            float bestW = -1.f;
-            for (int i = 1; i <= nInl; ++i)
-            {
-                if (i < nInl &&
-                    eY[inlBuf[i]] - eY[inlBuf[i - 1]] <= maxGap)
-                    continue;
-                // 连续子段 [segStart, i) 收口：节点数最多者胜，平局
-                // 比权重和（确定性）
-                const int cnt = i - segStart;
-                float sw = 0.f;
-                for (int q = segStart; q < i; ++q)
-                    sw += eW[inlBuf[q]];
-                if (cnt > bestCnt || (cnt == bestCnt && sw > bestW))
-                {
-                    bestCnt = cnt;
-                    bestStart = segStart;
-                    bestW = sw;
-                }
-                segStart = i;
-            }
-            if (bestCnt < kMinNodeInl)
-                break; // 最大连续子段仍不足最小门限：剩余内点为零散
-                       // 垃圾聚簇，整线作废并终止提取
-            for (int q = 0; q < bestCnt; ++q) // 原地收拢为选中子段
-                inlBuf[q] = inlBuf[bestStart + q];
-            inlBuf.resize(bestCnt);
-            // 子段重新加权精修（内点集即子段本身，不再重收——子段
-            // 内纵向无大间隙，LSQ 后残差只会更小）
-            wlsFit(eX.data(), eY.data(), eW.data(), inlBuf.data(),
-                   bestCnt, p.fit_quad, mA2, mA1, mA0);
         }
         const int clOff = (int)candInl.size();
         remark.assign(nRem, 0);
