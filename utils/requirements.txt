@@ -1,0 +1,6 @@
+# annotate.py / train.py 依赖（Python 3.8+）
+#   annotate.py: opencv-python
+#   train.py:    numpy + scikit-learn
+opencv-python>=4.5
+numpy>=1.20
+scikit-learn>=1.0
